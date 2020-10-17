@@ -343,7 +343,7 @@ if (COG_PLATFORM_DRM AND NOT COG_USE_WEBKITGTK)
         ${COGPLATFORM_DRM_DEPS_LDFLAGS}
     )
 
-    add_library(cogplatform-drm MODULE platform/cog-platform-drm.c)
+    add_library(cogplatform-drm MODULE platform/cog-platform-drm.c platform/kms.c platform/cursor-drm.c)
     set_property(TARGET cogplatform-drm PROPERTY C_STANDARD 99)
     target_include_directories(cogplatform-drm PUBLIC ${COGPLATFORM_DRM_INCLUDE_DIRS})
     target_compile_options(cogplatform-drm PUBLIC ${COGPLATFORM_DRM_CFLAGS})

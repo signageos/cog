@@ -12,6 +12,9 @@
 #include <wpe/fdo-egl.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
+#include <drm_fourcc.h>
+#include "kms.h"
+#include "cursor-drm.h"
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -85,6 +88,16 @@ typedef struct keyboard_event {
     uint32_t key;
 } keyboard_event;
 
+struct cursor {
+    gboolean enabled;
+    struct kms_plane *plane;
+    struct kms_framebuffer *cursor;
+    unsigned int x;
+    unsigned int y;
+    unsigned int screen_width;
+    unsigned int screen_height;
+};
+
 static struct {
     struct udev *udev;
     struct libinput *libinput;
@@ -97,6 +110,8 @@ static struct {
     struct wpe_input_touch_event_raw touch_points[10];
     enum wpe_input_touch_event_type last_touch_type;
     int last_touch_id;
+
+    struct cursor cursor;
 } input_data = {
     .udev = NULL,
     .libinput = NULL,
@@ -105,6 +120,13 @@ static struct {
     .repeating_key = {0, 0},
     .last_touch_type = wpe_input_touch_event_type_null,
     .last_touch_id = 0,
+    .cursor = {
+        .enabled = FALSE,
+        .plane = NULL,
+        .cursor = NULL,
+        .x = 0,
+        .y = 0,
+    },
 };
 
 static struct {
@@ -168,6 +190,60 @@ clear_drm (void)
         close (drm_data.fd);
         drm_data.fd = -1;
     }
+}
+
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+
+static const uint32_t formats[] = {
+    DRM_FORMAT_RGBA8888,
+    DRM_FORMAT_ARGB8888,
+};
+
+static uint32_t choose_format(struct kms_plane *plane)
+{
+    for (int i = 0; i < ARRAY_SIZE(formats); i++) {
+        if (kms_plane_supports_format(plane, formats[i]))
+            return formats[i];
+    }
+
+    return 0;
+}
+
+static gboolean
+initialize_cursor(int fd)
+{
+    struct kms_device *device;
+    uint32_t format;
+
+    device = kms_device_open(fd);
+    if (!device)
+        return FALSE;
+
+    input_data.cursor.plane = kms_device_find_plane_by_type(device, DRM_PLANE_TYPE_CURSOR, 0);
+    if (!input_data.cursor.plane)
+        return FALSE;
+
+    format = choose_format(input_data.cursor.plane);
+    if (!format)
+        return FALSE;
+
+    input_data.cursor.cursor = create_cursor_framebuffer(device, format);
+    if (!input_data.cursor.cursor)
+        return FALSE;
+
+    input_data.cursor.x = (device->screens[0]->width - input_data.cursor.cursor->width) / 2;
+    input_data.cursor.y = (device->screens[0]->height - input_data.cursor.cursor->height) / 2;
+    input_data.cursor.screen_width = device->screens[0]->width;
+    input_data.cursor.screen_height = device->screens[0]->height;
+
+    if (kms_plane_set(input_data.cursor.plane, input_data.cursor.cursor, input_data.cursor.x, input_data.cursor.y)) {
+        g_clear_pointer(&input_data.cursor.cursor, kms_framebuffer_free);
+        return FALSE;
+    }
+
+    input_data.cursor.enabled = TRUE;
+
+    return TRUE;
 }
 
 static gboolean
@@ -264,6 +340,19 @@ init_drm (void)
         if (resources->crtcs[i] == drm_data.crtc_id) {
             drm_data.crtc_index = i;
             break;
+        }
+    }
+
+    if (g_getenv("WPE_DRM_CURSOR")) {
+        bool cursorSupported = drmSetClientCap(drm_data.fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1) == 0;
+        if (cursorSupported) {
+            if (initialize_cursor(drm_data.fd)) {
+                printf("cursor initialized\n");
+            } else {
+                printf("cursor failed to initialize\n");
+            }
+        } else {
+            printf("cursor not supported\n");
         }
     }
 
@@ -556,6 +645,62 @@ input_handle_touch_event (enum libinput_event_type touch_type, struct libinput_e
 }
 
 static void
+input_handle_pointer_motion_event(struct libinput_event_pointer *pointer_event)
+{
+    if (!input_data.cursor.enabled)
+        return;
+
+    double dx = libinput_event_pointer_get_dx(pointer_event);
+    double dy = libinput_event_pointer_get_dy(pointer_event);
+
+    input_data.cursor.x = input_data.cursor.x + dx;
+    if (input_data.cursor.x < 0) {
+        input_data.cursor.x = 0;
+    } else if (input_data.cursor.x > input_data.cursor.screen_width - 1) {
+        input_data.cursor.x = input_data.cursor.screen_width - 1;
+    }
+
+    input_data.cursor.y = input_data.cursor.y + dy;
+    if (input_data.cursor.y < 0) {
+        input_data.cursor.y = 0;
+    } else if (input_data.cursor.y > input_data.cursor.screen_height - 1) {
+        input_data.cursor.y = input_data.cursor.screen_height - 1;
+    }
+
+    struct wpe_input_pointer_event event = {
+        .type = wpe_input_pointer_event_type_motion,
+        .time = libinput_event_pointer_get_time(pointer_event),
+        .x = input_data.cursor.x,
+        .y = input_data.cursor.y,
+        .button = 0,
+        .state = 0,
+        .modifiers = 0,
+    };
+
+    wpe_view_backend_dispatch_pointer_event(wpe_view_data.backend, &event);
+    kms_plane_set(input_data.cursor.plane, input_data.cursor.cursor, input_data.cursor.x, input_data.cursor.y);
+}
+
+static void
+input_handle_pointer_button_event(struct libinput_event_pointer *pointer_event)
+{
+    if (!input_data.cursor.enabled)
+        return;
+
+    struct wpe_input_pointer_event event = {
+        .type = wpe_input_pointer_event_type_button,
+        .time = libinput_event_pointer_get_time(pointer_event),
+        .x = input_data.cursor.x,
+        .y = input_data.cursor.y,
+        .button = libinput_event_pointer_get_button(pointer_event),
+        .state = libinput_event_pointer_get_button_state(pointer_event),
+        .modifiers = 0,
+    };
+
+    wpe_view_backend_dispatch_pointer_event(wpe_view_data.backend, &event);
+}
+
+static void
 input_process_events (void)
 {
     g_assert (input_data.libinput);
@@ -577,6 +722,12 @@ input_process_events (void)
             case LIBINPUT_EVENT_TOUCH_FRAME:
                 input_handle_touch_event (event_type,
                                           libinput_event_get_touch_event (event));
+                break;
+            case LIBINPUT_EVENT_POINTER_MOTION:
+                input_handle_pointer_motion_event(libinput_event_get_pointer_event(event));
+                break;
+            case LIBINPUT_EVENT_POINTER_BUTTON:
+                input_handle_pointer_button_event(libinput_event_get_pointer_event(event));
                 break;
             default:
                 break;
